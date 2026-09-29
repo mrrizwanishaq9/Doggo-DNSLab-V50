@@ -1,0 +1,2820 @@
+import dns.resolver
+import dns.rdatatype
+import dns.exception
+import dns.query
+
+#!/usr/bin/env python3
+"""
+DOGGO DNSLAB V50
+Professional DNS Diagnostic Laboratory
+Single-file Python Edition
+
+Features:
+- A / AAAA / CNAME / MX / NS / TXT / SOA / PTR
+- CAA / SRV / NAPTR / HTTPS / SVCB / ANY / Custom
+- IPv4 / IPv6 modes
+- UDP / TCP DNS
+- DNS-over-HTTPS
+- DNS-over-TLS connectivity test
+- DNS-over-QUIC architecture-ready
+- Cloudflare / Google / Quad9 / Custom resolver
+- Resolver comparison
+- Response-time testing
+- DNS health check
+- Propagation comparison
+- Reverse DNS
+- JSON / CSV / TXT reports
+- History / cache
+- Batch domains / records
+- IDN / Punycode
+- Timeout / retry controls
+- Interactive + CLI mode
+- Dashboard / statistics
+"""
+
+import argparse
+import csv
+import datetime
+import ipaddress
+import json
+import os
+import re
+import socket
+import ssl
+import statistics
+import sys
+import time
+from pathlib import Path
+
+APP_NAME = "Doggo DNSLab"
+VERSION = "V50"
+
+CONFIG_FILE = Path.home() / ".doggo_dnslab_config.json"
+HISTORY_FILE = Path.home() / ".doggo_dnslab_history.json"
+CACHE_FILE = Path.home() / ".doggo_dnslab_cache.json"
+
+RESOLVERS = {
+    "Cloudflare": "1.1.1.1",
+    "Google": "8.8.8.8",
+    "Quad9": "9.9.9.9",
+}
+
+RECORD_TYPES = [
+    "A",
+    "AAAA",
+    "CNAME",
+    "MX",
+    "NS",
+    "TXT",
+    "SOA",
+    "PTR",
+    "CAA",
+    "SRV",
+    "NAPTR",
+    "HTTPS",
+    "SVCB",
+    "ANY",
+]
+
+USE_COLOR = sys.stdout.isatty() and os.getenv("NO_COLOR") is None
+
+COLORS = {
+    "reset": "\033[0m",
+    "red": "\033[91m",
+    "green": "\033[92m",
+    "yellow": "\033[93m",
+    "blue": "\033[94m",
+    "cyan": "\033[96m",
+    "white": "\033[97m",
+    "magenta": "\033[95m",
+    "bold": "\033[1m",
+}
+
+
+def paint(text, color):
+    if not USE_COLOR:
+        return str(text)
+    return f"{COLORS[color]}{text}{COLORS['reset']}"
+
+
+def timestamp():
+    return datetime.datetime.now().astimezone().isoformat(
+        timespec="seconds"
+    )
+
+
+def load_json(path, default):
+    try:
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return default
+
+
+def save_json(path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        if CONFIG.get("debug"):
+            print(paint(f"[DEBUG] Save error: {e}", "red"))
+
+
+CONFIG = {
+    "resolver": "1.1.1.1",
+    "resolver_name": "Cloudflare",
+    "protocol": "udp",
+    "family": "auto",
+    "timeout": 3.0,
+    "retries": 2,
+    "cache_ttl": 60,
+    "debug": False,
+}
+
+CONFIG.update(load_json(CONFIG_FILE, {}))
+
+HISTORY = load_json(HISTORY_FILE, [])
+CACHE = load_json(CACHE_FILE, {})
+
+
+def save_state():
+    save_json(CONFIG_FILE, CONFIG)
+    save_json(HISTORY_FILE, HISTORY[-300:])
+    save_json(CACHE_FILE, CACHE)
+
+
+def banner():
+    print(paint("""
+╔══════════════════════════════════════════════════════════════════╗
+║                     DOGGO DNSLAB V50                           ║
+║              PROFESSIONAL DNS DIAGNOSTIC LAB                   ║
+╠══════════════════════════════════════════════════════════════════╣
+║ Records • Resolvers • Diagnostics • Reports • Batch • Cache   ║
+╚══════════════════════════════════════════════════════════════════╝
+""", "cyan"))
+
+
+def clean_domain(domain):
+    domain = str(domain).strip()
+
+    if "://" in domain:
+        domain = domain.split("://", 1)[1]
+
+    domain = domain.split("/", 1)[0]
+    domain = domain.split("?", 1)[0]
+    domain = domain.split("#", 1)[0]
+
+    return domain.rstrip(".").lower()
+
+
+def validate_domain(domain):
+    domain = clean_domain(domain)
+
+    if not domain:
+        return False, "Empty domain"
+
+    if len(domain) > 253:
+        return False, "Domain is longer than 253 characters"
+
+    try:
+        ipaddress.ip_address(domain)
+        return False, "IP address detected instead of domain"
+    except ValueError:
+        pass
+
+    try:
+        ascii_domain = domain.encode("idna").decode("ascii")
+    except Exception as e:
+        return False, f"IDN conversion failed: {e}"
+
+    labels = ascii_domain.split(".")
+
+    if any(not label for label in labels):
+        return False, "Empty DNS label"
+
+    for label in labels:
+
+        if len(label) > 63:
+            return False, "DNS label is longer than 63 characters"
+
+        if not re.match(
+            r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$",
+            label,
+        ):
+            return False, f"Invalid label: {label}"
+
+    return True, ascii_domain
+
+
+def to_punycode(domain):
+    try:
+        return clean_domain(domain).encode("idna").decode("ascii")
+    except Exception:
+        return clean_domain(domain)
+
+
+def from_punycode(domain):
+    try:
+        return clean_domain(domain).encode("ascii").decode("idna")
+    except Exception:
+        return clean_domain(domain)
+
+
+def require_dns():
+    try:
+        import dns.resolver
+        import dns.rdatatype
+        import dns.exception
+        import dns.query
+
+        return {
+            "resolver": dns.resolver,
+            "rdatatype": dns.rdatatype,
+            "exception": dns.exception,
+            "query": dns.query,
+        }
+
+    except ImportError:
+        print(paint(
+            "\n[!] dnspython is not installed.\n"
+            "Install with:\n"
+            "python -m pip install dnspython\n",
+            "yellow",
+        ))
+        return None
+
+
+def make_resolver(dns_lib, nameserver):
+    resolver = dns_lib["resolver"].Resolver(configure=False)
+
+    resolver.nameservers = [nameserver]
+
+    resolver.timeout = float(CONFIG["timeout"])
+
+    resolver.lifetime = (
+        float(CONFIG["timeout"])
+        * max(1, int(CONFIG["retries"]))
+    )
+
+    return resolver
+
+
+def cache_key(domain, record, resolver, protocol):
+    return (
+        f"{domain.lower()}|"
+        f"{record.upper()}|"
+        f"{resolver}|"
+        f"{protocol}"
+    )
+
+
+def cache_get(key):
+
+    item = CACHE.get(key)
+
+    if not item:
+        return None
+
+    try:
+        age = time.time() - float(item["time"])
+
+        if age <= float(CONFIG["cache_ttl"]):
+            return item["data"]
+
+    except Exception:
+        pass
+
+    CACHE.pop(key, None)
+
+    return None
+
+
+def cache_put(key, data):
+
+    CACHE[key] = {
+        "time": time.time(),
+        "data": data,
+    }
+
+    if len(CACHE) > 1000:
+
+        keys = sorted(
+            CACHE,
+            key=lambda x: CACHE[x].get("time", 0),
+        )
+
+        for key in keys[:100]:
+            CACHE.pop(key, None)
+
+
+def rdata_text(rdata):
+
+    try:
+        return rdata.to_text().strip()
+    except Exception:
+        return str(rdata).strip()
+
+
+def rdata_to_dict(rdata, record_type):
+
+    text = rdata_text(rdata)
+
+    item = {
+        "type": record_type,
+        "value": text,
+    }
+
+    if record_type in ("A", "AAAA"):
+
+        if hasattr(rdata, "address"):
+            item["address"] = rdata.address
+
+    elif record_type in ("CNAME", "NS", "PTR"):
+
+        attr = {
+            "CNAME": "target",
+            "NS": "target",
+            "PTR": "target",
+        }[record_type]
+
+        if hasattr(rdata, attr):
+            item[attr] = str(
+                getattr(rdata, attr)
+            ).rstrip(".")
+
+    elif record_type == "MX":
+
+        if hasattr(rdata, "preference"):
+            item["preference"] = int(
+                rdata.preference
+            )
+
+        if hasattr(rdata, "exchange"):
+            item["exchange"] = str(
+                rdata.exchange
+            ).rstrip(".")
+
+    elif record_type == "SRV":
+
+        for attr in [
+            "priority",
+            "weight",
+            "port",
+            "target",
+        ]:
+
+            if hasattr(rdata, attr):
+
+                value = getattr(rdata, attr)
+
+                if attr == "target":
+                    value = str(value).rstrip(".")
+
+                else:
+                    value = int(value)
+
+                item[attr] = value
+
+    elif record_type == "SOA":
+
+        for attr in [
+            "mname",
+            "rname",
+            "serial",
+            "refresh",
+            "retry",
+            "expire",
+            "minimum",
+        ]:
+
+            if hasattr(rdata, attr):
+
+                value = getattr(rdata, attr)
+
+                if attr in ("mname", "rname"):
+                    value = str(value).rstrip(".")
+                else:
+                    value = int(value)
+
+                item[attr] = value
+
+    return item
+
+
+def add_history(result):
+
+    HISTORY.append({
+        "time": timestamp(),
+        "domain": result.get("domain"),
+        "record": result.get("record"),
+        "resolver": result.get("resolver"),
+        "protocol": CONFIG.get("protocol"),
+        "ok": result.get("ok"),
+        "response_ms": result.get("response_ms"),
+        "answers": len(result.get("answers", [])),
+        "error": result.get("error", ""),
+    })
+
+    save_state()
+
+
+def resolve_dns(
+    domain,
+    record_type,
+    nameserver=None,
+    use_cache=True,
+):
+
+    dns_lib = require_dns()
+
+    if not dns_lib:
+        return {
+            "ok": False,
+            "error": "dnspython is not installed",
+        }
+
+    domain = clean_domain(domain)
+
+    valid, normalized = validate_domain(domain)
+
+    if not valid:
+        return {
+            "ok": False,
+            "domain": domain,
+            "record": record_type,
+            "error": normalized,
+        }
+
+    domain = normalized
+
+    nameserver = (
+        nameserver
+        or CONFIG["resolver"]
+    )
+
+    protocol = CONFIG["protocol"]
+
+    key = cache_key(
+        domain,
+        record_type,
+        nameserver,
+        protocol,
+    )
+
+    if use_cache:
+
+        cached = cache_get(key)
+
+        if cached is not None:
+
+            result = {
+                "ok": True,
+                "domain": domain,
+                "record": record_type,
+                "resolver": nameserver,
+                "cached": True,
+                **cached,
+            }
+
+            return result
+
+    started = time.perf_counter()
+
+    last_error = ""
+
+    for attempt in range(
+        max(1, int(CONFIG["retries"]))
+    ):
+
+        try:
+
+            resolver = make_resolver(
+                dns_lib,
+                nameserver,
+            )
+
+            if protocol == "tcp":
+
+                answer = resolver.resolve(
+                    domain,
+                    record_type,
+                    tcp=True,
+                )
+
+            else:
+
+                answer = resolver.resolve(
+                    domain,
+                    record_type,
+                    tcp=False,
+                )
+
+            answers = []
+
+            for rr in answer:
+                answers.append(
+                    rdata_to_dict(
+                        rr,
+                        record_type,
+                    )
+                )
+
+            elapsed = (
+                time.perf_counter()
+                - started
+            ) * 1000
+
+            ttl = None
+
+            try:
+                ttl = answer.rrset.ttl
+            except Exception:
+                pass
+
+            data = {
+                "answers": answers,
+                "ttl": ttl,
+                "response_ms": round(
+                    elapsed,
+                    2,
+                ),
+                "attempts": attempt + 1,
+                "cached": False,
+            }
+
+            cache_put(
+                key,
+                data,
+            )
+
+            result = {
+                "ok": True,
+                "domain": domain,
+                "record": record_type,
+                "resolver": nameserver,
+                **data,
+            }
+
+            add_history(result)
+
+            return result
+
+        except Exception as e:
+
+            last_error = str(e)
+
+            if CONFIG.get("debug"):
+                print(
+                    paint(
+                        f"[DEBUG] Attempt {attempt + 1}: {e}",
+                        "red",
+                    )
+                )
+
+    elapsed = (
+        time.perf_counter()
+        - started
+    ) * 1000
+
+    result = {
+        "ok": False,
+        "domain": domain,
+        "record": record_type,
+        "resolver": nameserver,
+        "response_ms": round(
+            elapsed,
+            2,
+        ),
+        "attempts": CONFIG["retries"],
+        "answers": [],
+        "error": last_error,
+    }
+
+    add_history(result)
+
+    return result
+
+
+def print_result(result):
+
+    print()
+
+    if not result.get("ok"):
+
+        print(
+            paint(
+                "✗ DNS QUERY FAILED",
+                "red",
+            )
+        )
+
+        print(
+            "Error:",
+            result.get(
+                "error",
+                "Unknown error",
+            ),
+        )
+
+        return
+
+    print(
+        paint(
+            "✓ DNS QUERY SUCCESSFUL",
+            "green",
+        )
+    )
+
+    print(
+        f"Domain   : {result.get('domain')}"
+    )
+
+    print(
+        f"Record   : {result.get('record')}"
+    )
+
+    print(
+        f"Resolver : {result.get('resolver')}"
+    )
+
+    print(
+        f"Protocol : {CONFIG.get('protocol')}"
+    )
+
+    print(
+        f"Time     : {result.get('response_ms')} ms"
+    )
+
+    print(
+        f"Cached   : "
+        f"{'YES' if result.get('cached') else 'NO'}"
+    )
+
+    print(
+        f"Answers  : "
+        f"{len(result.get('answers', []))}"
+    )
+
+    if result.get("ttl") is not None:
+        print(
+            f"TTL      : {result['ttl']}"
+        )
+
+    print()
+
+    for index, answer in enumerate(
+        result.get("answers", []),
+        1,
+    ):
+
+        print(
+            f"  [{index:02d}] "
+            f"{answer.get('value', '')}"
+        )
+
+
+def ask_domain():
+
+    while True:
+
+        domain = input(
+            "Enter domain: "
+        ).strip()
+
+        valid, normalized = validate_domain(
+            domain
+        )
+
+        if valid:
+            return normalized
+
+        print(
+            paint(
+                f"Invalid domain: {normalized}",
+                "red",
+            )
+        )
+
+
+def record_query():
+
+    print(
+        "\nAvailable records:"
+    )
+
+    print(
+        ", ".join(RECORD_TYPES)
+    )
+
+    record = input(
+        "Record type: "
+    ).strip().upper()
+
+    if not record:
+        record = "A"
+
+    if record == "PTR":
+
+        ip = input(
+            "IPv4/IPv6 address: "
+        ).strip()
+
+        reverse_lookup(ip)
+
+        return
+
+    if record not in RECORD_TYPES:
+
+        if not re.match(
+            r"^[A-Z0-9-]{1,15}$",
+            record,
+        ):
+
+            print(
+                paint(
+                    "Invalid DNS record type.",
+                    "red",
+                )
+            )
+
+            return
+
+    domain = ask_domain()
+
+    result = resolve_dns(
+        domain,
+        record,
+    )
+
+    print_result(result)
+
+
+def reverse_lookup(ip):
+
+    try:
+        address = ipaddress.ip_address(
+            ip.strip()
+        )
+
+        reverse_name = address.reverse_pointer
+
+    except ValueError:
+
+        print(
+            paint(
+                "Invalid IP address.",
+                "red",
+            )
+        )
+
+        return
+
+    print(
+        f"\nReverse DNS name: {reverse_name}"
+    )
+
+    result = resolve_dns(
+        reverse_name,
+        "PTR",
+        use_cache=False,
+    )
+
+    print_result(result)
+
+
+def resolver_test(
+    resolver,
+    domain,
+    record="A",
+):
+
+    result = resolve_dns(
+        domain,
+        record,
+        nameserver=resolver,
+        use_cache=False,
+    )
+
+    return {
+        "ok": result.get("ok", False),
+        "resolver": resolver,
+        "ms": result.get(
+            "response_ms"
+        ),
+        "answers": len(
+            result.get(
+                "answers",
+                [],
+            )
+        ),
+        "error": result.get(
+            "error",
+            "",
+        ),
+    }
+
+
+def resolver_comparison():
+
+    domain = ask_domain()
+
+    print(
+        paint(
+            f"\nResolver comparison: {domain}\n",
+            "cyan",
+        )
+    )
+
+    results = []
+
+    for name, resolver in RESOLVERS.items():
+
+        print(
+            f"Testing {name} "
+            f"({resolver})..."
+        )
+
+        result = resolver_test(
+            resolver,
+            domain,
+        )
+
+        result["name"] = name
+
+        results.append(result)
+
+    custom = input(
+        "\nCustom resolver IP "
+        "(Enter to skip): "
+    ).strip()
+
+    if custom:
+
+        try:
+
+            ipaddress.ip_address(
+                custom
+            )
+
+            result = resolver_test(
+                custom,
+                domain,
+            )
+
+            result["name"] = "Custom"
+
+            results.append(result)
+
+        except ValueError:
+
+            print(
+                paint(
+                    "Invalid resolver IP.",
+                    "red",
+                )
+            )
+
+    print()
+    print(
+        "Resolver        Status      Time        Answers"
+    )
+    print(
+        "-" * 58
+    )
+
+    for result in results:
+
+        status = (
+            "OK"
+            if result["ok"]
+            else "FAIL"
+        )
+
+        ms = result["ms"]
+
+        if isinstance(
+            ms,
+            (int, float),
+        ):
+            ms_text = f"{ms:.2f} ms"
+        else:
+            ms_text = "-"
+
+        print(
+            f"{result['name']:<15}"
+            f"{status:<12}"
+            f"{ms_text:<12}"
+            f"{result['answers']}"
+        )
+
+    print(
+        "\nThis is a local network-path comparison,"
+        " not a global resolver ranking."
+    )
+
+
+def response_time_test():
+
+    domain = ask_domain()
+
+    record = input(
+        "Record [A]: "
+    ).strip().upper() or "A"
+
+    try:
+        samples = int(
+            input(
+                "Samples [5]: "
+            ).strip() or "5"
+        )
+
+    except ValueError:
+        samples = 5
+
+    samples = max(
+        1,
+        min(
+            samples,
+            30,
+        ),
+    )
+
+    times = []
+
+    print()
+
+    for number in range(
+        1,
+        samples + 1,
+    ):
+
+        result = resolve_dns(
+            domain,
+            record,
+            use_cache=False,
+        )
+
+        if result.get("ok"):
+
+            ms = result["response_ms"]
+
+            times.append(ms)
+
+            print(
+                f"Sample {number:02d}: "
+                f"{ms} ms"
+            )
+
+        else:
+
+            print(
+                f"Sample {number:02d}: "
+                f"FAIL"
+            )
+
+    if not times:
+        print(
+            paint(
+                "\nNo successful samples.",
+                "red",
+            )
+        )
+        return
+
+    print()
+    print(
+        f"Minimum : {min(times):.2f} ms"
+    )
+
+    print(
+        f"Average : {statistics.mean(times):.2f} ms"
+    )
+
+    print(
+        f"Maximum : {max(times):.2f} ms"
+    )
+
+    if len(times) > 1:
+        print(
+            f"Median  : {statistics.median(times):.2f} ms"
+        )
+
+
+def health_check():
+
+    domain = ask_domain()
+
+    checks = [
+        "A",
+        "AAAA",
+        "CNAME",
+        "MX",
+        "NS",
+        "TXT",
+        "SOA",
+        "CAA",
+    ]
+
+    print(
+        paint(
+            f"\nDNS HEALTH CHECK: {domain}",
+            "cyan",
+        )
+    )
+
+    success = 0
+
+    for record in checks:
+
+        result = resolve_dns(
+            domain,
+            record,
+            use_cache=False,
+        )
+
+        if result.get("ok"):
+
+            success += 1
+
+            print(
+                paint(
+                    f" ✓ {record:<6} "
+                    f"{len(result.get('answers', []))} "
+                    f"answer(s) "
+                    f"{result.get('response_ms')} ms",
+                    "green",
+                )
+            )
+
+        else:
+
+            print(
+                f" • {record:<6} "
+                f"no answer / "
+                f"{str(result.get('error'))[:50]}"
+            )
+
+    print()
+    print(
+        f"Responsive checks: "
+        f"{success}/{len(checks)}"
+    )
+
+    print(
+        "A missing optional DNS record does not"
+        " automatically mean the DNS is unhealthy."
+    )
+
+
+def propagation_check():
+
+    domain = ask_domain()
+
+    record = input(
+        "Record [A]: "
+    ).strip().upper() or "A"
+
+    results = []
+
+    print(
+        paint(
+            f"\nDNS propagation comparison"
+            f"\nDomain: {domain}"
+            f"\nRecord: {record}\n",
+            "cyan",
+        )
+    )
+
+    for name, resolver in RESOLVERS.items():
+
+        result = resolve_dns(
+            domain,
+            record,
+            nameserver=resolver,
+            use_cache=False,
+        )
+
+        results.append(
+            (
+                name,
+                result,
+            )
+        )
+
+        values = [
+            str(x.get("value"))
+            for x in result.get(
+                "answers",
+                [],
+            )
+        ]
+
+        print(
+            f"{name} ({resolver})"
+        )
+
+        print(
+            f"  Status: "
+            f"{'OK' if result.get('ok') else 'FAIL'}"
+        )
+
+        print(
+            f"  Time  : "
+            f"{result.get('response_ms', '-')}"
+            f" ms"
+        )
+
+        print(
+            f"  Value : "
+            f"{', '.join(values) if values else '-'}"
+        )
+
+    value_sets = []
+
+    for _, result in results:
+
+        if result.get("ok"):
+
+            values = tuple(
+                sorted(
+                    str(x.get("value"))
+                    for x in result.get(
+                        "answers",
+                        [],
+                    )
+                )
+            )
+
+            value_sets.append(values)
+
+    if value_sets:
+
+        if len(set(value_sets)) == 1:
+
+            print(
+                paint(
+                    "\nAll tested resolvers returned "
+                    "the same answer set.",
+                    "green",
+                )
+            )
+
+        else:
+
+            print(
+                paint(
+                    "\nResolvers returned different "
+                    "answer sets.",
+                    "yellow",
+                )
+            )
+
+            print(
+                "Possible causes include TTL/cache timing,"
+                " geographic DNS behavior, or configuration."
+            )
+
+
+def batch_domains():
+
+    filename = input(
+        "Input file (.txt/.csv): "
+    ).strip().strip('"')
+
+    path = Path(filename)
+
+    if not path.exists():
+
+        print(
+            paint(
+                "File not found.",
+                "red",
+            )
+        )
+
+        return
+
+    domains = []
+
+    try:
+
+        if path.suffix.lower() == ".csv":
+
+            with open(
+                path,
+                "r",
+                encoding="utf-8-sig",
+                newline="",
+            ) as f:
+
+                reader = csv.reader(f)
+
+                for row in reader:
+
+                    if row and row[0].strip():
+
+                        domains.append(
+                            row[0].strip()
+                        )
+
+        else:
+
+            with open(
+                path,
+                "r",
+                encoding="utf-8",
+            ) as f:
+
+                for line in f:
+
+                    line = line.strip()
+
+                    if (
+                        line
+                        and not line.startswith("#")
+                    ):
+                        domains.append(line)
+
+    except Exception as e:
+
+        print(
+            paint(
+                f"File error: {e}",
+                "red",
+            )
+        )
+
+        return
+
+    domains = domains[:500]
+
+    record = input(
+        "Record [A]: "
+    ).strip().upper() or "A"
+
+    output = Path(
+        "doggo_batch_results.csv"
+    )
+
+    rows = []
+
+    print()
+
+    for domain in domains:
+
+        result = resolve_dns(
+            domain,
+            record,
+            use_cache=False,
+        )
+
+        status = (
+            "OK"
+            if result.get("ok")
+            else "FAIL"
+        )
+
+        print(
+            f"{domain:<40}"
+            f"{status:<7}"
+            f"{result.get('response_ms', '-')}"
+            f" ms"
+        )
+
+        rows.append({
+            "domain": domain,
+            "record": record,
+            "status": status,
+            "response_ms": result.get(
+                "response_ms"
+            ),
+            "answers": len(
+                result.get(
+                    "answers",
+                    [],
+                )
+            ),
+            "error": result.get(
+                "error",
+                "",
+            ),
+        })
+
+    with open(
+        output,
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as f:
+
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "domain",
+                "record",
+                "status",
+                "response_ms",
+                "answers",
+                "error",
+            ],
+        )
+
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(
+        paint(
+            f"\nSaved: {output.resolve()}",
+            "green",
+        )
+    )
+
+
+def batch_records():
+
+    domain = ask_domain()
+
+    raw = input(
+        "Records [A,AAAA,MX,NS,TXT]: "
+    ).strip()
+
+    if raw:
+
+        records = [
+            x.strip().upper()
+            for x in raw.split(",")
+            if x.strip()
+        ]
+
+    else:
+
+        records = [
+            "A",
+            "AAAA",
+            "MX",
+            "NS",
+            "TXT",
+        ]
+
+    output = Path(
+        "doggo_record_scan.csv"
+    )
+
+    rows = []
+
+    for record in records:
+
+        result = resolve_dns(
+            domain,
+            record,
+            use_cache=False,
+        )
+
+        print_result(result)
+
+        rows.append({
+            "domain": domain,
+            "record": record,
+            "status": (
+                "OK"
+                if result.get("ok")
+                else "FAIL"
+            ),
+            "response_ms": result.get(
+                "response_ms"
+            ),
+            "answers": json.dumps(
+                result.get(
+                    "answers",
+                    [],
+                ),
+                ensure_ascii=False,
+            ),
+            "error": result.get(
+                "error",
+                "",
+            ),
+        })
+
+    with open(
+        output,
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as f:
+
+        writer = csv.DictWriter(
+            f,
+            fieldnames=list(
+                rows[0].keys()
+            ),
+        )
+
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(
+        paint(
+            f"\nSaved: {output.resolve()}",
+            "green",
+        )
+    )
+
+
+def export_result():
+
+    domain = ask_domain()
+
+    record = input(
+        "Record [A]: "
+    ).strip().upper() or "A"
+
+    result = resolve_dns(
+        domain,
+        record,
+        use_cache=False,
+    )
+
+    print(
+        "\n1. JSON"
+        "\n2. CSV"
+        "\n3. TXT"
+    )
+
+    choice = input(
+        "Format: "
+    ).strip()
+
+    if choice == "1":
+
+        output = Path(
+            "doggo_result.json"
+        )
+
+        with open(
+            output,
+            "w",
+            encoding="utf-8",
+        ) as f:
+
+            json.dump(
+                result,
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
+
+    elif choice == "2":
+
+        output = Path(
+            "doggo_result.csv"
+        )
+
+        with open(
+            output,
+            "w",
+            newline="",
+            encoding="utf-8",
+        ) as f:
+
+            writer = csv.writer(f)
+
+            writer.writerow([
+                "domain",
+                "record",
+                "resolver",
+                "status",
+                "response_ms",
+                "value",
+            ])
+
+            for answer in result.get(
+                "answers",
+                [],
+            ):
+
+                writer.writerow([
+                    result.get("domain"),
+                    result.get("record"),
+                    result.get("resolver"),
+                    result.get("ok"),
+                    result.get("response_ms"),
+                    answer.get("value"),
+                ])
+
+    else:
+
+        output = Path(
+            "doggo_result.txt"
+        )
+
+        lines = [
+            f"{APP_NAME} {VERSION}",
+            f"Generated: {timestamp()}",
+            f"Domain: {result.get('domain')}",
+            f"Record: {result.get('record')}",
+            f"Resolver: {result.get('resolver')}",
+            f"Status: {result.get('ok')}",
+            f"Response: {result.get('response_ms')} ms",
+        ]
+
+        for answer in result.get(
+            "answers",
+            [],
+        ):
+
+            lines.append(
+                f"Answer: "
+                f"{answer.get('value')}"
+            )
+
+        if result.get("error"):
+            lines.append(
+                f"Error: {result['error']}"
+            )
+
+        output.write_text(
+            "\n".join(lines),
+            encoding="utf-8",
+        )
+
+    print(
+        paint(
+            f"Saved: {output.resolve()}",
+            "green",
+        )
+    )
+
+
+def show_history():
+
+    if not HISTORY:
+
+        print(
+            "No DNS query history."
+        )
+
+        return
+
+    print(
+        paint(
+            "\nQUERY HISTORY",
+            "cyan",
+        )
+    )
+
+    print(
+        "-" * 100
+    )
+
+    for item in HISTORY[-50:][::-1]:
+
+        status = (
+            "OK"
+            if item.get("ok")
+            else "FAIL"
+        )
+
+        print(
+            f"{item.get('time',''):<26}"
+            f"{str(item.get('domain','')):<30}"
+            f"{str(item.get('record','')):<8}"
+            f"{status:<7}"
+            f"{str(item.get('response_ms','-'))} ms"
+        )
+
+
+def cache_manager():
+
+    print(
+        f"\nCache entries: {len(CACHE)}"
+    )
+
+    print(
+        "\n1. Show cache keys"
+        "\n2. Clear cache"
+        "\n0. Back"
+    )
+
+    choice = input(
+        "Choice: "
+    ).strip()
+
+    if choice == "1":
+
+        for key in list(CACHE.keys())[:100]:
+            print(
+                " ",
+                key,
+            )
+
+    elif choice == "2":
+
+        CACHE.clear()
+
+        save_state()
+
+        print(
+            paint(
+                "Cache cleared.",
+                "green",
+            )
+        )
+
+
+def domain_validator():
+
+    domain = input(
+        "Domain: "
+    ).strip()
+
+    valid, result = validate_domain(
+        domain
+    )
+
+    if valid:
+
+        print(
+            paint(
+                "✓ VALID DOMAIN",
+                "green",
+            )
+        )
+
+        print(
+            "ASCII/Punycode:",
+            result,
+        )
+
+        print(
+            "Unicode:",
+            from_punycode(result),
+        )
+
+    else:
+
+        print(
+            paint(
+                "✗ INVALID DOMAIN",
+                "red",
+            )
+        )
+
+        print(
+            "Reason:",
+            result,
+        )
+
+
+def idn_manager():
+
+    value = input(
+        "Domain / Punycode: "
+    ).strip()
+
+    print(
+        "\nOriginal:",
+        value,
+    )
+
+    print(
+        "Punycode:",
+        to_punycode(value),
+    )
+
+    print(
+        "Unicode :",
+        from_punycode(value),
+    )
+
+
+def configuration():
+
+    while True:
+
+        print(
+            paint(
+                "\nCONFIGURATION",
+                "cyan",
+            )
+        )
+
+        print(
+            f"1. Resolver  : "
+            f"{CONFIG['resolver']}"
+        )
+
+        print(
+            f"2. Protocol  : "
+            f"{CONFIG['protocol']}"
+        )
+
+        print(
+            f"3. Family    : "
+            f"{CONFIG['family']}"
+        )
+
+        print(
+            f"4. Timeout   : "
+            f"{CONFIG['timeout']} sec"
+        )
+
+        print(
+            f"5. Retries   : "
+            f"{CONFIG['retries']}"
+        )
+
+        print(
+            f"6. Cache TTL : "
+            f"{CONFIG['cache_ttl']} sec"
+        )
+
+        print(
+            f"7. Debug     : "
+            f"{CONFIG['debug']}"
+        )
+
+        print(
+            "\n8. Save"
+            "\n0. Back"
+        )
+
+        choice = input(
+            "Choice: "
+        ).strip()
+
+        if choice == "0":
+            break
+
+        elif choice == "1":
+
+            print(
+                "\nBuilt-in resolvers:"
+            )
+
+            for name, ip in RESOLVERS.items():
+                print(
+                    f"  {name}: {ip}"
+                )
+
+            value = input(
+                "Resolver IP: "
+            ).strip()
+
+            try:
+
+                ipaddress.ip_address(
+                    value
+                )
+
+                CONFIG["resolver"] = value
+                CONFIG["resolver_name"] = "Custom"
+
+            except ValueError:
+
+                print(
+                    paint(
+                        "Invalid IP.",
+                        "red",
+                    )
+                )
+
+        elif choice == "2":
+
+            value = input(
+                "Protocol [udp/tcp]: "
+            ).strip().lower()
+
+            if value in ("udp", "tcp"):
+                CONFIG["protocol"] = value
+            else:
+                print(
+                    paint(
+                        "Use udp or tcp.",
+                        "yellow",
+                    )
+                )
+
+        elif choice == "3":
+
+            value = input(
+                "Family [auto/ipv4/ipv6]: "
+            ).strip().lower()
+
+            if value in (
+                "auto",
+                "ipv4",
+                "ipv6",
+            ):
+
+                CONFIG["family"] = value
+
+        elif choice == "4":
+
+            try:
+
+                CONFIG["timeout"] = max(
+                    0.2,
+                    min(
+                        30,
+                        float(
+                            input(
+                                "Timeout seconds: "
+                            )
+                        ),
+                    ),
+                )
+
+            except ValueError:
+                pass
+
+        elif choice == "5":
+
+            try:
+
+                CONFIG["retries"] = max(
+                    1,
+                    min(
+                        10,
+                        int(
+                            input(
+                                "Retries: "
+                            )
+                        ),
+                    ),
+                )
+
+            except ValueError:
+                pass
+
+        elif choice == "6":
+
+            try:
+
+                CONFIG["cache_ttl"] = max(
+                    0,
+                    min(
+                        3600,
+                        int(
+                            input(
+                                "Cache TTL seconds: "
+                            )
+                        ),
+                    ),
+                )
+
+            except ValueError:
+                pass
+
+        elif choice == "7":
+
+            CONFIG["debug"] = not CONFIG["debug"]
+
+            print(
+                "Debug:",
+                CONFIG["debug"],
+            )
+
+        elif choice == "8":
+
+            save_state()
+
+            print(
+                paint(
+                    "Configuration saved.",
+                    "green",
+                )
+            )
+
+
+def dashboard():
+
+    total = len(HISTORY)
+
+    success = sum(
+        1
+        for item in HISTORY
+        if item.get("ok")
+    )
+
+    failed = total - success
+
+    times = [
+        float(item["response_ms"])
+        for item in HISTORY
+        if isinstance(
+            item.get("response_ms"),
+            (int, float),
+        )
+    ]
+
+    average = (
+        statistics.mean(times)
+        if times
+        else 0
+    )
+
+    print(
+        paint("""
+╔══════════════════════════════════════════════════════════════════╗
+║                    DOGGO V50 DASHBOARD                         ║
+╠══════════════════════════════════════════════════════════════════╣
+║                 DNS DIAGNOSTICS & STATISTICS                  ║
+╚══════════════════════════════════════════════════════════════════╝
+""", "cyan")
+    )
+
+    print(
+        f"Resolver       : "
+        f"{CONFIG['resolver']} "
+        f"({CONFIG.get('resolver_name','Custom')})"
+    )
+
+    print(
+        f"Protocol       : "
+        f"{CONFIG['protocol'].upper()}"
+    )
+
+    print(
+        f"Address Family : "
+        f"{CONFIG['family'].upper()}"
+    )
+
+    print(
+        f"Timeout        : "
+        f"{CONFIG['timeout']} sec"
+    )
+
+    print(
+        f"Retries        : "
+        f"{CONFIG['retries']}"
+    )
+
+    print(
+        f"History        : "
+        f"{total}"
+    )
+
+    print(
+        f"Successful     : "
+        f"{success}"
+    )
+
+    print(
+        f"Failed         : "
+        f"{failed}"
+    )
+
+    print(
+        f"Cache Entries  : "
+        f"{len(CACHE)}"
+    )
+
+    if times:
+
+        print(
+            f"Average Time   : "
+            f"{average:.2f} ms"
+        )
+
+        print(
+            f"Minimum Time   : "
+            f"{min(times):.2f} ms"
+        )
+
+        print(
+            f"Maximum Time   : "
+            f"{max(times):.2f} ms"
+        )
+
+    else:
+
+        print(
+            "Average Time   : -"
+        )
+
+    print(
+        "\nSupported records:"
+    )
+
+    print(
+        ", ".join(RECORD_TYPES)
+    )
+
+    print(
+        "\nTransports:"
+    )
+
+    print(
+        "UDP • TCP • DoH • DoT • DoQ-ready"
+    )
+
+
+def doh_query(domain, record="A"):
+
+    try:
+        import requests
+    except ImportError:
+
+        return {
+            "ok": False,
+            "error": (
+                "requests is not installed. "
+                "Run: python -m pip install requests"
+            ),
+        }
+
+    domain = clean_domain(domain)
+
+    valid, normalized = validate_domain(
+        domain
+    )
+
+    if not valid:
+
+        return {
+            "ok": False,
+            "error": normalized,
+        }
+
+    url = (
+        "https://cloudflare-dns.com/dns-query"
+    )
+
+    started = time.perf_counter()
+
+    try:
+
+        response = requests.get(
+            url,
+            params={
+                "name": normalized,
+                "type": record,
+            },
+            headers={
+                "accept":
+                    "application/dns-json",
+            },
+            timeout=float(
+                CONFIG["timeout"]
+            ),
+        )
+
+        elapsed = (
+            time.perf_counter()
+            - started
+        ) * 1000
+
+        data = response.json()
+
+        answers = []
+
+        for answer in (
+            data.get("Answer", [])
+            or []
+        ):
+
+            answers.append({
+                "type": answer.get("type"),
+                "name": answer.get("name"),
+                "value": answer.get("data"),
+                "ttl": answer.get("TTL"),
+            })
+
+        return {
+            "ok": (
+                response.ok
+                and data.get("Status") == 0
+            ),
+            "domain": normalized,
+            "record": record,
+            "resolver": "Cloudflare DoH",
+            "response_ms": round(
+                elapsed,
+                2,
+            ),
+            "answers": answers,
+            "dns_status": data.get(
+                "Status"
+            ),
+            "error": (
+                ""
+                if response.ok
+                else f"HTTP {response.status_code}"
+            ),
+        }
+
+    except Exception as e:
+
+        return {
+            "ok": False,
+            "error": str(e),
+        }
+
+
+def doh_menu():
+
+    domain = ask_domain()
+
+    record = input(
+        "Record [A]: "
+    ).strip().upper() or "A"
+
+    result = doh_query(
+        domain,
+        record,
+    )
+
+    print_result(result)
+
+
+def dot_probe():
+
+    host = input(
+        "DoT host [cloudflare-dns.com]: "
+    ).strip()
+
+    if not host:
+        host = "cloudflare-dns.com"
+
+    print(
+        "\nConnecting to DNS-over-TLS..."
+    )
+
+    started = time.perf_counter()
+
+    try:
+
+        context = ssl.create_default_context()
+
+        with socket.create_connection(
+            (
+                host,
+                853,
+            ),
+            timeout=float(
+                CONFIG["timeout"]
+            ),
+        ) as raw_socket:
+
+            with context.wrap_socket(
+                raw_socket,
+                server_hostname=host,
+            ) as tls:
+
+                elapsed = (
+                    time.perf_counter()
+                    - started
+                ) * 1000
+
+                print(
+                    paint(
+                        "✓ DoT TLS connection established",
+                        "green",
+                    )
+                )
+
+                print(
+                    f"Host       : {host}:853"
+                )
+
+                print(
+                    f"TLS        : "
+                    f"{tls.version()}"
+                )
+
+                cipher = tls.cipher()
+
+                print(
+                    f"Cipher     : "
+                    f"{cipher[0] if cipher else '-'}"
+                )
+
+                print(
+                    f"Time       : "
+                    f"{elapsed:.2f} ms"
+                )
+
+                print(
+                    "\nNote: this menu performs a TLS "
+                    "connectivity probe."
+                )
+
+    except Exception as e:
+
+        print(
+            paint(
+                f"✗ DoT probe failed: {e}",
+                "red",
+            )
+        )
+
+
+def doq_ready():
+
+    print(
+        paint("""
+╔══════════════════════════════════════════════════════════════╗
+║                 DNS-over-QUIC STATUS                       ║
+╚══════════════════════════════════════════════════════════════╝
+
+Protocol : DNS-over-QUIC
+Transport: QUIC over UDP
+Typical port: 853
+
+Architecture status:
+✓ Resolver abstraction
+✓ Transport abstraction
+✓ Configuration-ready
+✓ Future adapter-ready
+
+The Python standard library does not provide a complete
+DNS-over-QUIC client. This V50 build therefore does not
+pretend to perform a DoQ query without a compatible QUIC
+library.
+
+A future adapter can use a library such as aioquic.
+""", "yellow")
+    )
+
+
+def show_cli_help():
+
+    print("""
+DOGGO DNSLAB V50 - CLI
+
+Examples:
+
+  python Doggo_DNSLab_V50.py -d example.com -t A
+
+  python Doggo_DNSLab_V50.py -d example.com -t MX
+
+  python Doggo_DNSLab_V50.py -d example.com -t TXT --json
+
+  python Doggo_DNSLab_V50.py -d example.com --health
+
+  python Doggo_DNSLab_V50.py -d example.com --compare
+
+  python Doggo_DNSLab_V50.py --reverse 8.8.8.8
+
+  python Doggo_DNSLab_V50.py -d example.com -t A --doh
+
+  python Doggo_DNSLab_V50.py -d example.com -t A --resolver 1.1.1.1
+""")
+
+
+def cli_mode(args):
+
+    if args.cli_help:
+
+        show_cli_help()
+
+        return True
+
+    if args.reverse:
+
+        reverse_name = None
+
+        try:
+
+            address = ipaddress.ip_address(
+                args.reverse
+            )
+
+            reverse_name = (
+                address.reverse_pointer
+            )
+
+        except ValueError:
+
+            print(
+                "Invalid IP address."
+            )
+
+            return True
+
+        result = resolve_dns(
+            reverse_name,
+            "PTR",
+            nameserver=args.resolver,
+            use_cache=False,
+        )
+
+        if args.json:
+
+            print(
+                json.dumps(
+                    result,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+
+        else:
+
+            print_result(result)
+
+        return True
+
+    if args.health:
+
+        if not args.domain:
+
+            print(
+                "--health requires --domain"
+            )
+
+            return True
+
+        domain = clean_domain(
+            args.domain
+        )
+
+        for record in [
+            "A",
+            "AAAA",
+            "MX",
+            "NS",
+            "SOA",
+            "TXT",
+        ]:
+
+            result = resolve_dns(
+                domain,
+                record,
+                nameserver=args.resolver,
+                use_cache=False,
+            )
+
+            if args.json:
+
+                print(
+                    json.dumps(
+                        result,
+                        ensure_ascii=False,
+                    )
+                )
+
+            else:
+
+                print(
+                    f"{record:<6}"
+                    f"{'OK' if result.get('ok') else 'FAIL':<7}"
+                    f"{result.get('response_ms','-')} ms"
+                )
+
+        return True
+
+    if args.compare:
+
+        if not args.domain:
+
+            print(
+                "--compare requires --domain"
+            )
+
+            return True
+
+        domain = clean_domain(
+            args.domain
+        )
+
+        results = []
+
+        for name, resolver in RESOLVERS.items():
+
+            result = resolver_test(
+                resolver,
+                domain,
+                args.type.upper(),
+            )
+
+            result["name"] = name
+
+            results.append(result)
+
+        if args.json:
+
+            print(
+                json.dumps(
+                    results,
+                    indent=2,
+                )
+            )
+
+        else:
+
+            for result in results:
+
+                print(
+                    f"{result['name']:<12}"
+                    f"{'OK' if result['ok'] else 'FAIL':<7}"
+                    f"{result['ms']} ms"
+                )
+
+        return True
+
+    if args.domain:
+
+        domain = clean_domain(
+            args.domain
+        )
+
+        record = (
+            args.type
+            or "A"
+        ).upper()
+
+        if args.doh:
+
+            result = doh_query(
+                domain,
+                record,
+            )
+
+        else:
+
+            result = resolve_dns(
+                domain,
+                record,
+                nameserver=args.resolver,
+                use_cache=not args.no_cache,
+            )
+
+        if args.json:
+
+            print(
+                json.dumps(
+                    result,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+
+        else:
+
+            print_result(result)
+
+        return True
+
+    return False
+
+
+def build_parser():
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Doggo DNSLab V50 "
+            "Professional DNS Diagnostics"
+        )
+    )
+
+    parser.add_argument(
+        "-d",
+        "--domain",
+        help="Domain name",
+    )
+
+    parser.add_argument(
+        "-t",
+        "--type",
+        default="A",
+        help="DNS record type",
+    )
+
+    parser.add_argument(
+        "--resolver",
+        help="DNS resolver IP",
+    )
+
+    parser.add_argument(
+        "--reverse",
+        help="Reverse DNS for IPv4/IPv6",
+    )
+
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="JSON output",
+    )
+
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Bypass local DNS cache",
+    )
+
+    parser.add_argument(
+        "--doh",
+        action="store_true",
+        help="Use Cloudflare DNS-over-HTTPS",
+    )
+
+    parser.add_argument(
+        "--health",
+        action="store_true",
+        help="DNS health check",
+    )
+
+    parser.add_argument(
+        "--compare",
+        action="store_true",
+        help="Compare DNS resolvers",
+    )
+
+    parser.add_argument(
+        "--cli-help",
+        action="store_true",
+        help="Show CLI examples",
+    )
+
+    return parser
+
+
+def main_menu():
+
+    while True:
+
+        print(
+            paint("""
+╔══════════════════════════════════════════════════════════════════╗
+║                         DOGGO V50 MENU                         ║
+╠══════════════════════════════════════════════════════════════════╣
+║ 01  Record Lookup             02  Resolver Comparison          ║
+║ 03  Response-Time Test        04  DNS Health Check             ║
+║ 05  Propagation Comparison    06  Reverse IPv4                 ║
+║ 07  Reverse IPv6              08  Batch Domain Scan             ║
+║ 09  Batch Record Scan         10  Export JSON/CSV/TXT          ║
+║ 11  Query History             12  Local DNS Cache              ║
+║ 13  Domain Validation         14  IDN / Punycode               ║
+║ 15  DNS-over-HTTPS            16  DNS-over-TLS                 ║
+║ 17  DNS-over-QUIC Ready       18  Configuration                ║
+║ 19  V50 Dashboard             20  Clear Cache                  ║
+║ 21  CLI Help                  00  Exit                         ║
+╚══════════════════════════════════════════════════════════════════╝
+""", "blue")
+        )
+
+        choice = input(
+            "Doggo> "
+        ).strip().lower()
+
+        try:
+
+            if choice == "1":
+                record_query()
+
+            elif choice == "2":
+                resolver_comparison()
+
+            elif choice == "3":
+                response_time_test()
+
+            elif choice == "4":
+                health_check()
+
+            elif choice == "5":
+                propagation_check()
+
+            elif choice == "6":
+
+                ip = input(
+                    "IPv4 address: "
+                ).strip()
+
+                try:
+
+                    if ipaddress.ip_address(
+                        ip
+                    ).version != 4:
+
+                        raise ValueError
+
+                    reverse_lookup(ip)
+
+                except ValueError:
+
+                    print(
+                        paint(
+                            "Invalid IPv4 address.",
+                            "red",
+                        )
+                    )
+
+            elif choice == "7":
+
+                ip = input(
+                    "IPv6 address: "
+                ).strip()
+
+                try:
+
+                    if ipaddress.ip_address(
+                        ip
+                    ).version != 6:
+
+                        raise ValueError
+
+                    reverse_lookup(ip)
+
+                except ValueError:
+
+                    print(
+                        paint(
+                            "Invalid IPv6 address.",
+                            "red",
+                        )
+                    )
+
+            elif choice == "8":
+                batch_domains()
+
+            elif choice == "9":
+                batch_records()
+
+            elif choice == "10":
+                export_result()
+
+            elif choice == "11":
+                show_history()
+
+            elif choice == "12":
+                cache_manager()
+
+            elif choice == "13":
+                domain_validator()
+
+            elif choice == "14":
+                idn_manager()
+
+            elif choice == "15":
+                doh_menu()
+
+            elif choice == "16":
+                dot_probe()
+
+            elif choice == "17":
+                doq_ready()
+
+            elif choice == "18":
+                configuration()
+
+            elif choice == "19":
+                dashboard()
+
+            elif choice == "20":
+
+                CACHE.clear()
+
+                save_state()
+
+                print(
+                    paint(
+                        "DNS cache cleared.",
+                        "green",
+                    )
+                )
+
+            elif choice == "21":
+                show_cli_help()
+
+            elif choice in (
+                "0",
+                "00",
+                "q",
+                "quit",
+                "exit",
+            ):
+
+                save_state()
+
+                print(
+                    paint(
+                        "\nDoggo DNSLab closed. Goodbye!",
+                        "cyan",
+                    )
+                )
+
+                break
+
+            else:
+
+                print(
+                    paint(
+                        "Unknown option.",
+                        "yellow",
+                    )
+                )
+
+        except KeyboardInterrupt:
+
+            print(
+                paint(
+                    "\nOperation cancelled.",
+                    "yellow",
+                )
+            )
+
+        except Exception as e:
+
+            print(
+                paint(
+                    f"\nUnexpected error: {e}",
+                    "red",
+                )
+            )
+
+            if CONFIG.get("debug"):
+
+                import traceback
+
+                traceback.print_exc()
+
+
+def main():
+
+    parser = build_parser()
+
+    args = parser.parse_args()
+
+    if args.resolver:
+
+        try:
+
+            ipaddress.ip_address(
+                args.resolver
+            )
+
+            CONFIG["resolver"] = (
+                args.resolver
+            )
+
+            CONFIG["resolver_name"] = (
+                "Custom"
+            )
+
+        except ValueError:
+
+            print(
+                paint(
+                    "Invalid resolver IP. "
+                    "Using configured resolver.",
+                    "yellow",
+                )
+            )
+
+    if cli_mode(args):
+
+        save_state()
+
+        return
+
+    banner()
+
+    print(
+        f"Python : "
+        f"{sys.version.split()[0]}"
+    )
+
+    print(
+        f"Config : "
+        f"{CONFIG_FILE}"
+    )
+
+    try:
+
+        import dns
+
+        print(
+            paint(
+                "dnspython: INSTALLED",
+                "green",
+            )
+        )
+
+    except ImportError:
+
+        print(
+            paint(
+                "dnspython: NOT INSTALLED",
+                "yellow",
+            )
+        )
+
+        print(
+            "Install:"
+        )
+
+        print(
+            "python -m pip install dnspython"
+        )
+
+    print()
+
+    main_menu()
+
+
+if __name__ == "__main__":
+    main()
